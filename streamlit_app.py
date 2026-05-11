@@ -2,7 +2,6 @@ import streamlit as st
 import pandas as pd
 from io import BytesIO
 import re
-import chardet
 
 st.set_page_config(page_title="Procesador de Remitos FRUTAPAC", page_icon="🍺", layout="wide")
 
@@ -26,12 +25,21 @@ pesos_dict = {
 st.sidebar.success(f"✅ Base cargada: {len(pesos_dict)} productos")
 
 # ============================================================
-# FUNCIÓN PARA DETECTAR CODIFICACIÓN
+# FUNCIÓN PARA DECODIFICAR (sin librerías externas)
 # ============================================================
-def detectar_encoding(archivo_bytes):
-    """Detecta la codificación del archivo"""
-    resultado = chardet.detect(archivo_bytes)
-    return resultado['encoding'] if resultado['encoding'] else 'latin-1'
+def decodificar_archivo(bytes_archivo):
+    """Intenta decodificar el archivo con diferentes codificaciones"""
+    codificaciones = ['utf-8', 'latin-1', 'cp1252', 'iso-8859-1']
+    
+    for encoding in codificaciones:
+        try:
+            texto = bytes_archivo.decode(encoding)
+            return texto, encoding
+        except UnicodeDecodeError:
+            continue
+    
+    # Si todas fallan, usar latin-1 que siempre funciona
+    return bytes_archivo.decode('latin-1', errors='replace'), 'latin-1'
 
 # ============================================================
 # PROCESAR TXT REAL
@@ -62,6 +70,7 @@ def procesar_txt(contenido):
         
         cantidad_str = ""
         for campo in campos:
+            # Busca patrón como "0000009.00"
             if re.match(r'0{6}\d+\.\d{2}', campo.strip()):
                 cantidad_str = campo.strip()
                 break
@@ -70,8 +79,10 @@ def procesar_txt(contenido):
             continue
         
         codigo = int(codigo_str)
+        # Convierte "0000009.00" a 9.0
         cantidad = float(cantidad_str)
         
+        # Convertir fecha YYYYMMDD a DD/MM/YYYY
         if len(fecha_raw) == 8 and fecha_raw.isdigit():
             fecha = f"{fecha_raw[6:8]}/{fecha_raw[4:6]}/{fecha_raw[0:4]}"
         else:
@@ -86,15 +97,18 @@ def procesar_txt(contenido):
         })
     
     if not datos:
-        return None, "No se encontraron datos válidos"
+        return None, "No se encontraron datos válidos en el archivo"
     
     df = pd.DataFrame(datos)
     
+    # Agregar pesos
     df['peso_unitario'] = df['codigo'].map(pesos_dict).fillna(0)
     df['peso_total_item'] = df['cantidad'] * df['peso_unitario']
     
+    # Detectar códigos sin peso
     sin_peso = df[df['peso_unitario'] == 0]['codigo'].unique().tolist()
     
+    # Agrupar por remito
     resumen = df.groupby('remito').agg({
         'cantidad': 'sum',
         'peso_total_item': 'sum',
@@ -114,18 +128,10 @@ def procesar_txt(contenido):
 archivo_subido = st.file_uploader("📂 Seleccioná el archivo TXT", type=['txt'])
 
 if archivo_subido is not None:
-    # Leer el archivo como bytes
     archivo_bytes = archivo_subido.getvalue()
+    contenido, encoding_usado = decodificar_archivo(archivo_bytes)
     
-    # Detectar la codificación automáticamente
-    encoding = detectar_encoding(archivo_bytes)
-    
-    try:
-        # Intentar decodificar con el encoding detectado
-        contenido = archivo_bytes.decode(encoding)
-    except:
-        # Si falla, probar con latin-1 (compatible con todo)
-        contenido = archivo_bytes.decode('latin-1')
+    st.info(f"📄 Codificación detectada: {encoding_usado}")
     
     with st.spinner("Procesando..."):
         resultado, sin_peso = procesar_txt(contenido)
@@ -141,11 +147,18 @@ if archivo_subido is not None:
         col3.metric("Peso Total", f"{resultado['Peso Total (kg)'].sum():.2f} kg")
         
         if sin_peso:
-            st.warning(f"⚠️ Códigos sin peso: {sin_peso}")
+            st.warning(f"⚠️ Códigos sin peso en la base de datos: {sin_peso}")
         
+        # Generar Excel
         output = BytesIO()
         with pd.ExcelWriter(output, engine='openpyxl') as writer:
-            resultado.to_excel(writer, sheet_name='Resumen', index=False)
-        st.download_button("📥 Descargar Excel", output.getvalue(), "reporte_remitos.xlsx")
+            resultado.to_excel(writer, sheet_name='Resumen por Remito', index=False)
+        
+        st.download_button(
+            label="📥 Descargar Reporte Excel",
+            data=output.getvalue(),
+            file_name="reporte_remitos.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        )
     else:
-        st.error(f"Error: {sin_peso if sin_peso else 'No se encontraron datos válidos en el archivo'}")
+        st.error(f"❌ {sin_peso if sin_peso else 'No se encontraron datos válidos en el archivo'}")
