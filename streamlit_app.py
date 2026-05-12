@@ -2,6 +2,7 @@ import streamlit as st
 import pandas as pd
 from io import BytesIO
 import re
+import requests
 
 st.set_page_config(page_title="Procesador de Remitos FRUTAPAC", page_icon="🍺", layout="wide")
 
@@ -9,9 +10,14 @@ st.title("🍺 Procesador de Remitos FRUTAPAC")
 st.markdown("Subí el archivo TXT con los datos de los remitos y obtené el peso total por remito")
 
 # ============================================================
-# BASE DE DATOS DE PESOS (COMPLETA)
+# URL DEL EXCEL EN GITHUB
 # ============================================================
-pesos_dict = {
+URL_EXCEL_GITHUB = "https://raw.githubusercontent.com/abulian14/lector-interface-excel/main/PESO%20X%20ARTICULOO.xlsx"
+
+# ============================================================
+# BASE DE DATOS DE PESOS POR DEFECTO
+# ============================================================
+PESOS_POR_DEFECTO = {
     1130001: 13.3, 1130015: 12.7, 1130016: 12.7, 1130017: 12.7, 1130018: 12.7,
     1133015: 12.7, 8880113: 3.6, 8880518: 1.9, 1140001: 13.3, 1140002: 13.3,
     1140003: 13.3, 1140015: 12.7, 1150006: 14.4, 1150008: 14.4, 1150010: 14.4,
@@ -22,31 +28,71 @@ pesos_dict = {
     1230016: 11.2, 1230017: 11.2, 1230018: 11.2, 8880105: 1.5, 8880106: 1.5,
 }
 
-st.sidebar.success(f"✅ Base cargada: {len(pesos_dict)} productos")
+# ============================================================
+# FUNCIÓN PARA CARGAR EXCEL DESDE GITHUB
+# ============================================================
+@st.cache_data(ttl=3600)
+def cargar_pesos_desde_github():
+    try:
+        response = requests.get(URL_EXCEL_GITHUB)
+        response.raise_for_status()
+        
+        with open("temp_pesos.xlsx", "wb") as f:
+            f.write(response.content)
+        
+        df = pd.read_excel("temp_pesos.xlsx", sheet_name='Hoja2')
+        df = df.dropna(how='all')
+        
+        encabezado_fila = None
+        for i, row in df.iterrows():
+            if row.astype(str).str.contains('CODIGO', case=False, na=False).any():
+                encabezado_fila = i
+                break
+        
+        if encabezado_fila is not None:
+            df = pd.read_excel("temp_pesos.xlsx", sheet_name='Hoja2', header=encabezado_fila)
+        
+        col_codigo = None
+        col_peso = None
+        
+        for col in df.columns:
+            col_str = str(col).upper().strip()
+            if 'CODIGO' in col_str or 'COD' in col_str:
+                col_codigo = col
+            if 'PESO' in col_str or 'KG' in col_str:
+                col_peso = col
+        
+        if col_codigo is None or col_peso is None:
+            return PESOS_POR_DEFECTO, f"⚠️ Columnas no encontradas: {df.columns.tolist()}"
+        
+        df[col_codigo] = pd.to_numeric(df[col_codigo], errors='coerce')
+        df[col_peso] = pd.to_numeric(df[col_peso], errors='coerce')
+        df = df.dropna(subset=[col_codigo, col_peso])
+        
+        pesos = dict(zip(df[col_codigo].astype(int), df[col_peso]))
+        return pesos, f"✅ Cargados {len(pesos)} productos desde GitHub"
+        
+    except Exception as e:
+        return PESOS_POR_DEFECTO, f"⚠️ Usando pesos por defecto. Error: {str(e)}"
 
 # ============================================================
-# FUNCIÓN PARA DECODIFICAR (sin librerías externas)
+# FUNCIÓN PARA DECODIFICAR ARCHIVO
 # ============================================================
 def decodificar_archivo(bytes_archivo):
-    """Intenta decodificar el archivo con diferentes codificaciones"""
     codificaciones = ['utf-8', 'latin-1', 'cp1252', 'iso-8859-1']
-    
     for encoding in codificaciones:
         try:
             texto = bytes_archivo.decode(encoding)
             return texto, encoding
         except UnicodeDecodeError:
             continue
-    
-    # Si todas fallan, usar latin-1 que siempre funciona
     return bytes_archivo.decode('latin-1', errors='replace'), 'latin-1'
 
 # ============================================================
-# PROCESAR TXT REAL
+# PROCESAR TXT - VERSIÓN CORREGIDA
 # ============================================================
-def procesar_txt(contenido):
+def procesar_txt(contenido, pesos_dict):
     lineas = contenido.strip().split('\n')
-    
     datos = []
     
     for linea in lineas:
@@ -55,32 +101,25 @@ def procesar_txt(contenido):
         
         campos = linea.split(';')
         
-        if len(campos) < 30:
+        if len(campos) < 10:
             continue
         
         nro_remito = campos[1].strip() if len(campos) > 1 else ""
         fecha_raw = campos[2].strip() if len(campos) > 2 else ""
         cliente = campos[7].strip() if len(campos) > 7 else ""
         
-        codigo_str = ""
-        for campo in campos:
-            if campo.strip().isdigit() and len(campo.strip()) == 7:
-                codigo_str = campo.strip()
-                break
+        # Buscar código de 7 dígitos en TODA la línea (no solo en campos)
+        codigo_match = re.search(r'\b(\d{7})\b', linea)
+        if not codigo_match:
+            continue
+        codigo = int(codigo_match.group(1))
         
-        cantidad_str = ""
-        for campo in campos:
-            # Busca patrón como "0000009.00"
-            if re.match(r'0{6}\d+\.\d{2}', campo.strip()):
-                cantidad_str = campo.strip()
-                break
-        
-        if not codigo_str or not cantidad_str:
+        # Buscar cantidad: patrón como 0000010.00 o 0000005.00
+        cantidad_match = re.search(r'0{6}(\d+)\.(\d{2})', linea)
+        if not cantidad_match:
             continue
         
-        codigo = int(codigo_str)
-        # Convierte "0000009.00" a 9.0
-        cantidad = float(cantidad_str)
+        cantidad = float(f"{cantidad_match.group(1)}.{cantidad_match.group(2)}")
         
         # Convertir fecha YYYYMMDD a DD/MM/YYYY
         if len(fecha_raw) == 8 and fecha_raw.isdigit():
@@ -101,11 +140,9 @@ def procesar_txt(contenido):
     
     df = pd.DataFrame(datos)
     
-    # Agregar pesos
     df['peso_unitario'] = df['codigo'].map(pesos_dict).fillna(0)
     df['peso_total_item'] = df['cantidad'] * df['peso_unitario']
     
-    # Detectar códigos sin peso
     sin_peso = df[df['peso_unitario'] == 0]['codigo'].unique().tolist()
     
     # Agrupar por remito
@@ -123,9 +160,23 @@ def procesar_txt(contenido):
     return resumen, sin_peso
 
 # ============================================================
-# INTERFAZ
+# MAIN
 # ============================================================
-archivo_subido = st.file_uploader("📂 Seleccioná el archivo TXT", type=['txt'])
+st.sidebar.header("📊 Base de Datos de Pesos")
+
+with st.spinner("Cargando base de datos desde GitHub..."):
+    pesos_dict, mensaje = cargar_pesos_desde_github()
+
+st.sidebar.success(mensaje)
+st.sidebar.info(f"📌 {len(pesos_dict)} productos disponibles")
+
+# Mostrar últimos códigos cargados
+with st.sidebar.expander("Ver códigos disponibles"):
+    codigos_lista = sorted(list(pesos_dict.keys()))[:20]
+    st.write(codigos_lista)
+
+st.header("📄 Procesar Remitos")
+archivo_subido = st.file_uploader("Seleccioná el archivo TXT con los remitos", type=['txt'])
 
 if archivo_subido is not None:
     archivo_bytes = archivo_subido.getvalue()
@@ -134,11 +185,10 @@ if archivo_subido is not None:
     st.info(f"📄 Codificación detectada: {encoding_usado}")
     
     with st.spinner("Procesando..."):
-        resultado, sin_peso = procesar_txt(contenido)
+        resultado, sin_peso = procesar_txt(contenido, pesos_dict)
     
     if resultado is not None and not resultado.empty:
         st.success(f"✅ Procesado! {len(resultado)} remitos encontrados")
-        
         st.dataframe(resultado, use_container_width=True)
         
         col1, col2, col3 = st.columns(3)
@@ -149,7 +199,6 @@ if archivo_subido is not None:
         if sin_peso:
             st.warning(f"⚠️ Códigos sin peso en la base de datos: {sin_peso}")
         
-        # Generar Excel
         output = BytesIO()
         with pd.ExcelWriter(output, engine='openpyxl') as writer:
             resultado.to_excel(writer, sheet_name='Resumen por Remito', index=False)
@@ -160,5 +209,11 @@ if archivo_subido is not None:
             file_name="reporte_remitos.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
         )
+        
+        # Mostrar detalle de productos por remito (para depuración)
+        with st.expander("📋 Ver detalle de productos procesados"):
+            st.write("Productos encontrados en el archivo:")
+            detalle_df = pd.DataFrame(datos)
+            st.dataframe(detalle_df)
     else:
         st.error(f"❌ {sin_peso if sin_peso else 'No se encontraron datos válidos en el archivo'}")
